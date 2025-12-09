@@ -1,0 +1,106 @@
+esta quase funcionando, alguns códigos não são encontrados, por que você esta procurando na coluna "Descrição do Produto" do pdf e esta errado.
+o correto é "Código do produto" no pdf txt.
+
+
+
+compare a coluna 
+"Produto" do excel
+
+exemplos:
+
+CAIXA ACOP DECA DUALFLUX GE CD.05F.17
+KIT BACIA C CX DECA M CARLO
+KIT BACIA C CX QUADRA BR KP.211.17 DECA
+BACIA ACOPLAR DECA IZY GELO P111-17
+ACABAMENTO REG DECA C-50 4900 PQ
+ACABAMENTO REG DECA C-35 4900 PQ
+BASE REGISTRO GAVETA DECA 1 4509-302
+REGISTRO ESF DECA 1552B 1/2
+VALVULA LAV DECA C 1602
+BASE REGISTRO GAVETA DECA 1 1/2 4509-502
+MECANISMO ACIONAM DECA LUX MAS 4336-004
+REGISTRO GAV BR DECA HD 1/2 1510
+KIT PROLONGADOR DECA 4504-020
+BASE REGISTRO GAVETA DECA 3/4 4509-202
+TORNEIRA BOIA DECA 1350 BSA 3/4
+LAVATORIO DECA L 12 IZY GE 17
+REGISTRO GAV BR DECA HD 3/4 1510
+BASE REGISTRO PRESSAO DECA 1/2 4416-102
+
+
+
+com a "Código do
+produto" do pdf
+
+exemplos:
+
+C-50 4900 PQ 
+4900.C50.PQ
+4509.502 
+4509.202
+KP.808.17
+1510.HD.012
+
+
+exemplos de alguns PADROES que diferem, mas não iguais:
+
+CD.05F.17 
+C-50 4900 PQ = 4900.C35.PQ
+4509-502 = 4509.502
+1552B 1/2 = 1552.B.012
+HD 1/2 1510 = 1510.HD.012
+C 1602 = 1602.C
+
+
+-----------------------------------------------------------------------
+documentação atualizada:
+
+
+CD.05F.17 = CD.05F.17
+KP.211.17 = KP.211.17
+C-50 4900 PQ = 4900.C50.PQ
+C-35 4900 PQ = 4900.C35.PQ
+4509-302 = 4509.302
+1552B 1/2 = 1552.B.012
+C 1602 = 1602.C
+4509-502 = 4509.502
+4336-004 = 4336.004
+HD 1/2 1510 = 1510.HD.012
+4504-020 = 4504.020
+4509-202 = 4509.202
+1350 BSA 3/4 = 1350.BSA.034
+HD 3/4 1510 = 1510.HD.034
+4416-102 = 4416.102
+
+
+Observações sobre Códigos Não Encontrados:
+
+1.
+KIT BACIA C CX DECA M CARLO: Não foi possível identificar um código no formato do Excel e não houve correspondência no PDF.
+
+2.
+BACIA ACOPLAR DECA IZY GELO P111-17: O código P111-17 não foi encontrado no PDF.
+
+3.
+LAVATORIO DECA L 12 IZY GE 17: O código L 12 IZY GE 17 não foi encontrado no PDF.
+
+Padrões de Variação Identificados:
+
+•
+Espaço/Hífen para Ponto: O caractere separador muda de espaço ( ) ou hífen (-) para ponto (.). Ex: 4509-302 -> 4509.302.
+
+•
+Reordenação de Componentes: Em alguns casos, a ordem dos componentes do código é invertida. Ex: C-50 4900 PQ (Excel) -> 4900.C50.PQ (PDF).
+
+•
+Formato de Medida (Fração): Frações como 1/2 e 3/4 são convertidas para um formato de três dígitos com zero à esquerda, precedido por ponto. Ex: 1/2 -> .012, 3/4 -> .034.
+
+•
+Posicionamento de Componentes: Componentes como C, B, HD, e BSA são movidos e separados por pontos. Ex: 1552B 1/2 -> 1552.B.012.
+
+•
+Códigos Idênticos: Alguns códigos são idênticos em ambas as fontes. Ex: CD.05F.17.
+
+
+
+

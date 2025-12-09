@@ -1,0 +1,13 @@
+Script para comparar quantidade e preço da AMANCO pdf e AMANCO excel:
+
+
+excel colunas:
+
+"Código Produto", "Produto", "Compra", "Valor de compra"
+
+Pdf colunas:
+
+"Código", "Qtde.", "Preço Líq."
+ 
+
+o objetivo é compara a "Compra" e "Qtde.", "Valor de compra" e "Preço Líq." e adicionar um arquivo excel com a comparação lado a lado.
