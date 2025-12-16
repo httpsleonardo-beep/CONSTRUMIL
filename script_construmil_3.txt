@@ -1,0 +1,1523 @@
+import flet as ft
+import pandas as pd
+import re
+import os
+import itertools
+import threading
+from pathlib import Path
+import warnings
+from openpyxl.styles import PatternFill, Font
+
+# Tenta importar pdfplumber (Essencial para Amanco)
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
+warnings.filterwarnings('ignore')
+
+
+# ==============================================================================
+#  CÉREBRO 1: DECA (TXT + EXCEL) - Lógica Original Mantida
+# ==============================================================================
+class DecaEngine:
+    def normalizar_codigo_pdf(self, codigo: str) -> list:
+        if not codigo: return []
+        codigo = str(codigo).upper().strip()
+        variacoes = set([codigo, codigo.replace('.', ''), codigo.replace('.', '-'), codigo.replace('.', ' ')])
+        mapa_fracoes = {'012': '1/2', '034': '3/4', '001': '1', '014': '1/4', '112': '1 1/2', '114': '1 1/4'}
+        partes = codigo.split('.')
+        if len(partes) >= 2:
+            tokens = []
+            for p in partes:
+                if p in mapa_fracoes:
+                    tokens.append([p, mapa_fracoes[p]])
+                elif re.match(r'^[A-Z]\d{2,3}$', p):
+                    tokens.append([p, f"{p[0]}-{p[1:]}", f"{p[0]} {p[1:]}"])
+                else:
+                    tokens.append([p])
+            for combo in itertools.product(*tokens):
+                variacoes.update([" ".join(combo), "-".join(combo), "".join(combo), " ".join(reversed(combo))])
+                if len(combo) == 3:
+                    variacoes.update([" ".join(p) for p in itertools.permutations(combo)])
+                    variacoes.add(f"{combo[0]}{combo[1]} {combo[2]}")
+                    variacoes.add(f"{combo[0]}{combo[1]} {combo[2].replace('/', '')}")
+        return [v.strip() for v in variacoes if len(v.strip()) > 2]
+
+    def buscar_codigo_na_descricao(self, descricao: str, variacoes_codigo: list) -> bool:
+        if not descricao or not variacoes_codigo: return False
+        desc_upper = str(descricao).upper()
+        for v in variacoes_codigo:
+            v_upper = v.upper()
+            if v_upper in desc_upper: return True
+            tokens = v_upper.split()
+            if len(tokens) > 1:
+                desc_limpa_tokens = re.sub(r'[^\w\s/]', ' ', desc_upper)
+                if all((t in desc_limpa_tokens or t in desc_upper) for t in tokens if len(t) > 1): return True
+            v_super_limpa = re.sub(r'[^A-Z0-9]', '', v_upper)
+            if len(v_super_limpa) > 4 and v_super_limpa in re.sub(r'[^A-Z0-9]', '', desc_upper): return True
+        return False
+
+    def limpar_valor(self, valor) -> float:
+        if pd.isna(valor) or valor == '': return 0.0
+        v = str(valor).replace('R$', '').replace('BRL', '').strip()
+        if re.search(r'\d{1,3}(\.\d{3})*,\d{2}', v):
+            v = v.replace('.', '').replace(',', '.')
+        elif ',' in v and v.count(',') == 1 and len(v.split(',')[1]) == 2:
+            v = v.replace(',', '.')
+        try:
+            return float(re.sub(r'[^\d.]', '', v))
+        except:
+            return 0.0
+
+    def ler_pdf_extraido(self, caminho_txt: str) -> pd.DataFrame:
+        with open(caminho_txt, 'r', encoding='utf-8') as f:
+            conteudo = f.read()
+        produtos = []
+        padroes = [
+            r'(?m)^([A-Z0-9][A-Z0-9.\-]{2,}(?:\.[A-Z0-9]+)*)\s+(?:.*?)\s+(\d{2}/\d{2}/\d{4})\s+(?:BRL\s*)?([\d.,]+)\s+([\d.,]+)',
+            r'(?m)^([A-Z0-9][A-Z0-9.\-]{2,}(?:\.[A-Z0-9]+)*)\t.*?\t(\d{2}/\d{2}/\d{4})\t(?:BRL\s*)?([\d.,]+)\t([\d.,]+)'
+        ]
+        for padrao in padroes:
+            for match in re.findall(padrao, conteudo):
+                if len(match) < 4: continue
+                cod, data, val_s, qtd_s = match[:4]
+                cod = cod.strip()
+                if len(cod) < 5 or cod == '2025' or 'BRL' in cod or '/' in cod: continue
+                qtd = int(self.limpar_valor(qtd_s))
+                if qtd > 0: produtos.append({'Código PDF': cod, 'Qtd PDF': qtd, 'Valor PDF': self.limpar_valor(val_s)})
+        df = pd.DataFrame(produtos)
+        return df.drop_duplicates(subset=['Código PDF']) if not df.empty else df
+
+    def ler_excel(self, caminho_excel: str) -> pd.DataFrame:
+        try:
+            df = pd.read_excel(caminho_excel, sheet_name="Produtos")
+        except:
+            try:
+                df = pd.read_excel(caminho_excel)
+            except:
+                try:
+                    df = pd.read_csv(caminho_excel, sep=';', encoding='latin1')
+                except:
+                    raise Exception("Falha ao ler Excel/CSV.")
+
+        df.columns = [str(c).strip() for c in df.columns]
+        col_prod = next((c for c in df.columns if 'descri' in c.lower()), None)
+        if not col_prod:
+            for c in df.columns:
+                cl = c.lower()
+                if ('produto' in cl or 'nome' in cl) and not ('código' in cl or 'codigo' in cl or 'cod' in cl):
+                    col_prod = c;
+                    break
+        if not col_prod: col_prod = next((c for c in df.columns if 'produto' in c.lower()), None)
+        col_qtd = next((c for c in df.columns if any(x in c.lower() for x in ['compra', 'qtd', 'quantidade'])), None)
+        col_val = next((c for c in df.columns if any(x in c.lower() for x in ['valor', 'preço', 'vlr', 'preco'])), None)
+
+        if not col_prod: raise Exception("Coluna de DESCRIÇÃO não encontrada.")
+        df_novo = pd.DataFrame()
+        df_novo['Produto Excel'] = df[col_prod]
+        df_novo['Qtd Excel'] = df[col_qtd] if col_qtd else 0
+        df_novo['Valor Excel'] = df[col_val] if col_val else 0.0
+        return df_novo
+
+    def processar(self, txt_path, excel_path, log_func):
+        log_func("DECA: Lendo PDF (TXT)...")
+        df_pdf = self.ler_pdf_extraido(txt_path)
+        log_func(f"DECA: {len(df_pdf)} códigos no PDF.")
+
+        log_func("DECA: Lendo Excel...")
+        df_excel = self.ler_excel(excel_path)
+        log_func(f"DECA: {len(df_excel)} linhas no Excel.")
+
+        log_func("DECA: Cruzando dados...")
+        resultados = []
+        matches = 0
+        for i, row in df_pdf.iterrows():
+            cod, qtd, val = str(row['Código PDF']), row['Qtd PDF'], row['Valor PDF']
+            variacoes = self.normalizar_codigo_pdf(cod)
+            match_data, melhor_diff = None, float('inf')
+
+            for _, row_ex in df_excel.iterrows():
+                desc = str(row_ex['Produto Excel'])
+                if self.buscar_codigo_na_descricao(desc, variacoes):
+                    diff = abs(val - self.limpar_valor(row_ex['Valor Excel']))
+                    if diff < melhor_diff:
+                        melhor_diff = diff
+                        match_data = row_ex
+
+            diff_qtd, diff_val = qtd, val
+            status = "❌ NÃO ENCONTRADO"
+            prod_ex, qtd_ex, val_ex = "---", 0, 0.0
+
+            if match_data is not None:
+                matches += 1
+                qtd_ex = int(self.limpar_valor(match_data['Qtd Excel']))
+                val_ex = self.limpar_valor(match_data['Valor Excel'])
+                diff_qtd = qtd - qtd_ex
+                diff_val = val - val_ex
+                prod_ex = match_data['Produto Excel']
+                status = "✓ OK" if diff_qtd == 0 and abs(diff_val) < 0.2 else "⚠ DIVERGENTE"
+
+            resultados.append({
+                'Código PDF': cod, 'Produto Excel': prod_ex,
+                'Qtd PDF': qtd, 'Qtd Excel': qtd_ex, 'Diferença Qtd': diff_qtd,
+                'Valor PDF': val, 'Valor Excel': val_ex, 'Diferença Valor': diff_val,
+                'Status': status
+            })
+
+        log_func(f"DECA: Matches: {matches}/{len(df_pdf)}")
+        return self.salvar(resultados, txt_path, "DECA", log_func)
+
+    def salvar(self, resultados, path, marca, log_func):
+        out_path = Path(path).parent / (Path(path).stem + f"_{marca}_RELATORIO.xlsx")
+        df = pd.DataFrame(resultados)
+        with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Conferência')
+            ws = writer.sheets['Conferência']
+            red = PatternFill(start_color='FFCCCC', end_color='FFCCCC', fill_type='solid')
+            green = PatternFill(start_color='CCFFCC', end_color='CCFFCC', fill_type='solid')
+            for row in range(2, ws.max_row + 1):
+                c = ws.cell(row=row, column=5)
+                if c.value and c.value != 0: c.fill = red if c.value < 0 else green
+                c = ws.cell(row=row, column=8)
+                if c.value and c.value != 0: c.fill = red if c.value > 0 else green
+            for col in ws.columns: ws.column_dimensions[col[0].column_letter].width = 15
+        log_func(f"{marca}: Salvo em {out_path.name}")
+        return out_path
+
+
+# ==============================================================================
+#  CÉREBRO 2: AMANCO (PDF + EXCEL) - Lógica Original Mantida
+# ==============================================================================
+class AmancoEngine:
+    class PriceComparator:
+        def __init__(self, excel_path, pdf_path, logger=None):
+            self.excel_path = excel_path
+            self.pdf_path = pdf_path
+            self.df_excel = None
+            self.df_pdf = None
+            self.logger = logger
+
+        def log(self, msg):
+            if self.logger:
+                self.logger(msg)
+            else:
+                print(msg)
+
+        def extract_product_code(self, product_text):
+            """
+            Extrai o código do produto do texto da coluna Produto.
+            Procura por sequências de 4-6 dígitos no final ou meio do texto.
+
+            Args:
+                product_text (str): Texto contendo o código do produto
+
+            Returns:
+                str: Código do produto encontrado ou None
+            """
+            if pd.isna(product_text):
+                return None
+
+            # Procura por sequências de 4-6 dígitos
+            matches = re.findall(r'\b(\d{4,6})\b', str(product_text))
+            # Retorna o último código encontrado (geralmente está no final)
+            return matches[-1] if matches else None
+
+        def clean_price(self, price_text):
+            if pd.isna(price_text): return None
+            price_str = str(price_text).replace('R$', '').replace('.', '').replace(',', '.').strip()
+            try:
+                return float(price_str)
+            except ValueError:
+                return None
+
+        def read_excel(self):
+            """
+            Lê a planilha Excel e extrai os códigos dos produtos.
+            """
+            print(f"📊 Lendo arquivo Excel: {self.excel_path}")
+
+            try:
+                self.df_excel = pd.read_excel(self.excel_path)
+
+                print(f"   Colunas encontradas: {list(self.df_excel.columns)}")
+
+                # Extrai código do produto da coluna 'Produto'
+                self.df_excel['Código Extraído'] = self.df_excel['Produto'].apply(
+                    self.extract_product_code
+                )
+
+                # Limpa a coluna 'Compra' se existir
+                if 'Compra' in self.df_excel.columns:
+                    self.df_excel['Compra'] = pd.to_numeric(
+                        self.df_excel['Compra'], errors='coerce'
+                    )
+
+                # Limpa a coluna 'Valor de compra' se existir
+                if 'Valor de compra' in self.df_excel.columns:
+                    self.df_excel['Valor de compra'] = pd.to_numeric(
+                        self.df_excel['Valor de compra'], errors='coerce'
+                    )
+
+                print(f"✅ Excel lido com sucesso: {len(self.df_excel)} linhas")
+                print(f"   Códigos extraídos: {self.df_excel['Código Extraído'].notna().sum()}")
+
+                # Mostra alguns exemplos
+                if not self.df_excel.empty:
+                    print(f"\n   Exemplos de códigos extraídos:")
+                    for idx, row in self.df_excel.head(3).iterrows():
+                        print(f"   - {row.get('Produto', 'N/A')} → Código: {row['Código Extraído']}")
+
+            except Exception as e:
+                print(f"❌ Erro ao ler Excel: {e}")
+                raise
+
+        def read_pdf(self):
+            """
+            Lê o arquivo PDF e extrai as informações de código, quantidade e preço.
+            Usa múltiplas estratégias para extrair os dados.
+            """
+            print(f"\n📄 Lendo arquivo PDF: {self.pdf_path}")
+
+            try:
+                pdf_data = []
+
+                with pdfplumber.open(self.pdf_path) as pdf:
+                    print(f"   Total de páginas: {len(pdf.pages)}")
+
+                    for page_num, page in enumerate(pdf.pages, 1):
+                        print(f"   Processando página {page_num}...")
+
+                        # Estratégia 1: Extrai tabelas estruturadas
+                        tables = page.extract_tables()
+
+                        if tables:
+                            for table_idx, table in enumerate(tables):
+                                if not table or len(table) < 2:
+                                    continue
+
+                                print(f"      Tabela {table_idx + 1} encontrada com {len(table)} linhas")
+
+                                # Mostra o cabeçalho para debug
+                                header = [str(h).lower() if h else '' for h in table[0]]
+                                print(f"      Cabeçalho: {header}")
+
+                                # Procura pelos índices das colunas
+                                codigo_idx = None
+                                qtde_idx = None
+                                preco_idx = None
+
+                                for i, h in enumerate(header):
+                                    if 'código' in h or 'codigo' in h:
+                                        codigo_idx = i
+                                    if 'qtde' in h or 'quantidade' in h:
+                                        qtde_idx = i
+                                    if 'preço líq' in h or 'preco liq' in h or 'preço liq' in h:
+                                        preco_idx = i
+
+                                print(f"      Índices: Código={codigo_idx}, Qtde={qtde_idx}, Preço={preco_idx}")
+
+                                if None in (codigo_idx, qtde_idx, preco_idx):
+                                    print(f"      ⚠️  Colunas necessárias não encontradas nesta tabela")
+                                    continue
+
+                                # Processa cada linha da tabela
+                                for row_idx, row in enumerate(table[1:], 1):
+                                    try:
+                                        if len(row) > max(codigo_idx, qtde_idx, preco_idx):
+                                            codigo = str(row[codigo_idx]).strip() if row[codigo_idx] else None
+                                            qtde = row[qtde_idx]
+                                            preco = row[preco_idx]
+
+                                            # Valida se há código (4-6 dígitos)
+                                            if codigo and re.match(r'^\d{4,6}$', codigo):
+                                                pdf_data.append({
+                                                    'Código_PDF': codigo,
+                                                    'Qtde_PDF': qtde,
+                                                    'Preço_Líq_PDF': preco
+                                                })
+
+                                    except Exception as e:
+                                        continue
+
+                        # Estratégia 2: Se não encontrou tabelas, tenta extrair texto
+                        if not tables or not pdf_data:
+                            text = page.extract_text()
+                            if text:
+                                print(f"      Tentando extrair do texto bruto...")
+                                # Procura por padrões de linhas de produtos
+                                lines = text.split('\n')
+                                for line in lines:
+                                    match = re.match(
+                                        r'^(\d{4,6})\s+.*?(?:BR\d+|0\d+)\s*-\s*.*?\s+(\d+)\s+R\$\s*([\d.,]+)',
+                                        line
+                                    )
+                                    if match:
+                                        codigo = match.group(1)
+                                        qtde = match.group(2)
+                                        preco = match.group(3)
+
+                                        pdf_data.append({
+                                            'Código_PDF': codigo,
+                                            'Qtde_PDF': qtde,
+                                            'Preço_Líq_PDF': preco
+                                        })
+
+                self.df_pdf = pd.DataFrame(pdf_data)
+
+                # Limpa os valores de quantidade e preço
+                if not self.df_pdf.empty:
+                    self.df_pdf['Qtde_PDF'] = pd.to_numeric(
+                        self.df_pdf['Qtde_PDF'], errors='coerce'
+                    )
+                    self.df_pdf['Preço_Líq_PDF'] = self.df_pdf['Preço_Líq_PDF'].apply(
+                        self.clean_price
+                    )
+
+                    # Remove duplicatas mantendo a primeira ocorrência
+                    self.df_pdf = self.df_pdf.drop_duplicates(subset=['Código_PDF'], keep='first')
+
+                print(f"✅ PDF lido com sucesso: {len(self.df_pdf)} itens únicos extraídos")
+
+                # Mostra alguns exemplos
+                if not self.df_pdf.empty:
+                    print(f"\n   Exemplos de itens extraídos do PDF:")
+                    for idx, row in self.df_pdf.head(3).iterrows():
+                        print(
+                            f"   - Código: {row['Código_PDF']} | Qtde: {row['Qtde_PDF']} | Preço: R$ {row['Preço_Líq_PDF']}")
+                else:
+                    print("\n   ⚠️  ATENÇÃO: Nenhum item foi extraído do PDF!")
+                    print("   Verifique se o PDF contém tabelas ou se a estrutura está correta.")
+
+            except Exception as e:
+                print(f"❌ Erro ao ler PDF: {e}")
+                raise
+
+        def merge_data(self):
+            """
+            Combina os dados do Excel e PDF baseado no código do produto.
+
+            Returns:
+                pd.DataFrame: DataFrame combinado com todas as informações
+            """
+            print("\n🔄 Combinando dados...")
+
+            if self.df_pdf.empty:
+                print("   ⚠️  PDF vazio - adicionando colunas vazias")
+                # Se o PDF está vazio, apenas adiciona colunas vazias
+                df_result = self.df_excel.copy()
+                df_result['Qtde_PDF'] = None
+                df_result['Preço_Líq_PDF'] = None
+            else:
+                # Faz o merge usando o código extraído do Excel e o código do PDF
+                df_result = self.df_excel.merge(
+                    self.df_pdf,
+                    left_on='Código Extraído',
+                    right_on='Código_PDF',
+                    how='left'
+                )
+
+                # Remove a coluna auxiliar Código_PDF
+                if 'Código_PDF' in df_result.columns:
+                    df_result = df_result.drop('Código_PDF', axis=1)
+
+                matches = df_result['Qtde_PDF'].notna().sum()
+                print(f"✅ Combinação concluída: {matches} correspondências encontradas")
+
+                if matches == 0:
+                    print("   ⚠️  Nenhuma correspondência encontrada!")
+                    print("   Verifique se os códigos do Excel e PDF estão no mesmo formato.")
+
+            return df_result
+
+        def calculate_differences(self, df_result):
+            self.log("Calculando diferenças...")
+            df_result['Diferença de Qtde'] = df_result['Qtde_PDF'] - df_result.get('Compra', 0)
+            df_result['Diferença de Preço'] = df_result['Preço_Líq_PDF'] - df_result.get('Valor de compra', 0)
+            return df_result
+
+        def save_result(self, df_result, output_path):
+            self.log(f"Salvando em: {Path(output_path).name}")
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                df_result.to_excel(writer, index=False, sheet_name='Comparação')
+                ws = writer.sheets['Comparação']
+                red = PatternFill(start_color='FFCCCC', end_color='FFCCCC', fill_type='solid')
+                green = PatternFill(start_color='CCFFCC', end_color='CCFFCC', fill_type='solid')
+
+                headers = [c.value for c in ws[1]]
+                try:
+                    qc = headers.index('Diferença de Qtde') + 1
+                    pc = headers.index('Diferença de Preço') + 1
+                    for row in range(2, len(df_result) + 2):
+                        c = ws.cell(row=row, column=qc)
+                        if c.value: c.fill = green if float(c.value) > 0 else red
+                        c = ws.cell(row=row, column=pc)
+                        if c.value: c.fill = red if float(c.value) > 0 else green
+                except:
+                    pass
+                for col in ws.columns: ws.column_dimensions[col[0].column_letter].width = 20
+
+    def processar(self, pdf_path, excel_path, log_func):
+        out_path = Path(pdf_path).parent / (Path(pdf_path).stem + "_AMANCO_RELATORIO.xlsx")
+        comparator = self.PriceComparator(excel_path, pdf_path, log_func)
+        comparator.read_excel()
+        comparator.read_pdf()
+        df = comparator.merge_data()
+        df = comparator.calculate_differences(df)
+        comparator.save_result(df, str(out_path))
+        return out_path
+
+
+# ==============================================================================
+#  CÉREBRO 3: LORENZETTI (TXT + EXCEL) - Lógica Original Mantida
+# ==============================================================================
+class LorenzettiEngine:
+    def limpar_valor(self, valor) -> float:
+        if pd.isna(valor) or valor == '': return 0.0
+        v = str(valor).replace('R$', '').replace(' ', '').strip()
+        if v.count('.') > 0 and v.count(',') > 0: v = v.replace('.', '')
+        v = v.replace(',', '.')
+        try:
+            return float(v)
+        except:
+            return 0.0
+
+    def extract_features(self, text):
+        text = str(text).upper()
+        clean_text = text.replace('LORENZETTI', '')
+        codes = set()
+        matches = re.findall(r'\b\d{3,4}[-\s]?[A-Z0-9]{1,3}\b', clean_text)
+        for m in matches:
+            if m.isdigit() and len(m) < 4: continue
+            if any(x in m for x in ['127', '220', '5500', '7500']): continue
+            codes.add(m.replace(' ', '').replace('-', ''))
+        nums = re.findall(r'\d+', clean_text)
+        nums = {int(n) for n in nums if int(n) > 20}
+        tokens = re.findall(r'[A-Z]+', clean_text)
+        tokens = {t for t in tokens if len(t) > 2 and t not in ['COM', 'PARA', 'DUCHA', 'TORNEIRA']}
+        first_word = text.split()[0] if text.split() else ""
+        return {'codes': codes, 'nums': nums, 'tokens': tokens, 'first': first_word}
+
+    def calculate_score(self, feat_exc, feat_pdf):
+        score = 0
+        if (220 in feat_exc['nums'] and 220 not in feat_pdf['nums'] and 127 in feat_pdf['nums']): return -1000
+        if (127 in feat_exc['nums'] and 127 not in feat_pdf['nums'] and 220 in feat_pdf['nums']): return -1000
+        if feat_exc['codes'].intersection(feat_pdf['codes']): score += 100
+        score += len(feat_exc['nums'].intersection(feat_pdf['nums'])) * 15
+        w1, w2 = feat_exc['first'], feat_pdf['first']
+        if w1 == w2:
+            score += 30
+        elif w1 in w2 or w2 in w1:
+            score += 20
+        score += len(feat_exc['tokens'].intersection(feat_pdf['tokens'])) * 10
+        return score
+
+    def ler_pdf_txt(self, caminho_txt):
+        with open(caminho_txt, 'r', encoding='utf-8') as f:
+            conteudo = f.read()
+        produtos = []
+        regex = r'(?m)^\s*\d+\s+\d{13}\s+(\d{5,8})\s+(.*?)\s+(PC|UN|CX|JG|KT|PEC|PÇ)\s+([0-9.]+)\s+([0-9,]+)'
+        for match in re.findall(regex, conteudo):
+            cod, desc, um, qtd, preco = match
+            if not cod.isdigit(): continue
+            produtos.append({
+                'Código PDF': cod.strip(), 'Descrição PDF': desc.strip(),
+                'Qtd PDF': int(self.limpar_valor(qtd)), 'Valor PDF': self.limpar_valor(preco)
+            })
+        df = pd.DataFrame(produtos)
+        if not df.empty: df = df.drop_duplicates(subset=['Código PDF'])
+        return df
+
+    def processar(self, txt_path, excel_path, log_func):
+        log_func("LORENZETTI: Lendo TXT...")
+        df_pdf = self.ler_pdf_txt(txt_path)
+        log_func("LORENZETTI: Lendo Excel...")
+        try:
+            df_excel = pd.read_excel(excel_path)
+        except:
+            df_excel = pd.read_csv(excel_path, sep=';', encoding='latin1')
+
+        try:
+            col_prod = "Produto";
+            col_qtd = "Compra";
+            col_val = "Valor de compra"
+            if col_prod not in df_excel.columns: df_excel.columns = [c.strip() for c in df_excel.columns]
+        except:
+            pass
+        if col_prod not in df_excel.columns:
+            col_prod = next((c for c in df_excel.columns if 'produto' in c.lower()), df_excel.columns[1])
+            col_qtd = next((c for c in df_excel.columns if 'compra' in c.lower()), df_excel.columns[2])
+            col_val = next((c for c in df_excel.columns if 'valor' in c.lower()), df_excel.columns[3])
+
+        pdf_features = []
+        for idx, row in df_pdf.iterrows():
+            pdf_features.append(
+                {'row': row, 'feat': self.extract_features(row['Descrição PDF'] + " " + str(row['Código PDF']))})
+
+        resultados = []
+        matches = 0
+        for _, row_ex in df_excel.iterrows():
+            desc_ex = str(row_ex[col_prod])
+            feat_ex = self.extract_features(desc_ex)
+            best_score = 0
+            best_match = None
+            for item in pdf_features:
+                score = self.calculate_score(feat_ex, item['feat'])
+                if score > best_score:
+                    best_score = score
+                    best_match = item['row']
+
+            status = "❌ NÃO ENCONTRADO"
+            cod_pdf, desc_pdf, qtd_pdf, val_pdf = "---", "---", 0, 0.0
+            if best_match is not None and best_score > 30:
+                matches += 1
+                cod_pdf = best_match['Código PDF']
+                desc_pdf = best_match['Descrição PDF']
+                qtd_pdf = best_match['Qtd PDF']
+                val_pdf = best_match['Valor PDF']
+                qtd_ex = int(self.limpar_valor(row_ex.get(col_qtd, 0)))
+                val_ex = self.limpar_valor(row_ex.get(col_val, 0))
+                status = "✓ OK" if (qtd_pdf - qtd_ex == 0) and (abs(val_pdf - val_ex) < 0.2) else "⚠ DIVERGENTE"
+            else:
+                qtd_ex = int(self.limpar_valor(row_ex.get(col_qtd, 0)))
+                val_ex = self.limpar_valor(row_ex.get(col_val, 0))
+
+            resultados.append({
+                'Descrição Excel': desc_ex, 'Descrição PDF': desc_pdf, 'Código PDF': cod_pdf,
+                'Qtd PDF': qtd_pdf, 'Qtd Excel': qtd_ex, 'Diferença Qtd': qtd_pdf - qtd_ex,
+                'Valor PDF': val_pdf, 'Valor Excel': val_ex, 'Diferença Valor': val_pdf - val_ex,
+                'Status': status
+            })
+
+        log_func(f"LORENZETTI: Matches: {matches}/{len(df_excel)}")
+        return self.salvar(resultados, txt_path, "LORENZETTI", log_func)
+
+    def salvar(self, resultados, path, marca, log_func):
+        out_path = Path(path).parent / (Path(path).stem + f"_{marca}_RELATORIO2.xlsx")
+        df = pd.DataFrame(resultados)
+        with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Conferência')
+            ws = writer.sheets['Conferência']
+            red = PatternFill(start_color='FFCCCC', end_color='FFCCCC', fill_type='solid')
+            green = PatternFill(start_color='CCFFCC', end_color='CCFFCC', fill_type='solid')
+            for row in range(2, ws.max_row + 1):
+                c = ws.cell(row=row, column=6)
+                if c.value and c.value != 0: c.fill = red if c.value < 0 else green
+                c = ws.cell(row=row, column=9)
+                if c.value and c.value != 0: c.fill = red if c.value > 0 else green
+            ws.column_dimensions['A'].width = 40
+            ws.column_dimensions['B'].width = 40
+        log_func(f"{marca}: Salvo em {out_path.name}")
+        return out_path
+
+
+# ==============================================================================
+#  INTERFACE FLET UNIFICADA
+# ==============================================================================
+
+def main(page: ft.Page):
+    page.title = "SISTEMA CONSTRUMIL - Conferência Inteligente"
+    page.window_width = 1000
+    page.window_height = 800
+    page.bgcolor = "#006cb5"
+    page.padding = 0
+    page.theme_mode = ft.ThemeMode.LIGHT
+
+    COL_MAIN = "#006cb5"
+    COL_PANEL = "#91d8f6"
+    COL_ACCENT = "#ec3237"
+    COL_TEXT = "#fefefe"
+    COL_DARK = "#0A1931"
+
+    files_state = {
+        "DECA": {"txt": None, "xls": None},
+        "AMANCO": {"txt": None, "xls": None},
+        "LORENZETTI": {"txt": None, "xls": None}
+    }
+    input_refs = {}
+
+    log_controls = {
+        "DECA": ft.Column(scroll=ft.ScrollMode.AUTO, height=200),
+        "AMANCO": ft.Column(scroll=ft.ScrollMode.AUTO, height=200),
+        "LORENZETTI": ft.Column(scroll=ft.ScrollMode.AUTO, height=200),
+    }
+
+    def add_log(marca, msg):
+        log_controls[marca].controls.append(ft.Text(f"> {msg}", color="#00FF00", font_family="Consolas"))
+        log_controls[marca].update()
+
+    picker_context = {"marca": None, "tipo": None}
+
+    def pick_file_result(e: ft.FilePickerResultEvent):
+        if e.files:
+            file_path = e.files[0].path
+            marca = picker_context["marca"]
+            tipo = picker_context["tipo"]
+            files_state[marca][tipo] = file_path
+            ref_key = f"{marca}_{tipo}"
+            if ref_key in input_refs:
+                input_refs[ref_key].value = file_path
+                input_refs[ref_key].update()
+
+    file_picker = ft.FilePicker(on_result=pick_file_result)
+    page.overlay.append(file_picker)
+
+    def start_picker(marca, tipo, allowed_ext):
+        picker_context["marca"] = marca
+        picker_context["tipo"] = tipo
+        file_picker.pick_files(allow_multiple=False, allowed_extensions=allowed_ext)
+
+    def run_process(marca):
+        txt = files_state[marca]["txt"]
+        xls = files_state[marca]["xls"]
+
+        try:
+            if marca == "DECA":
+                engine = DecaEngine()
+            elif marca == "AMANCO":
+                engine = AmancoEngine()
+            else:
+                engine = LorenzettiEngine()
+
+            add_log(marca, f"Iniciando {marca}...")
+            out = engine.processar(txt, xls, lambda m: add_log(marca, m))
+            add_log(marca, "SUCESSO COMPLETO!")
+
+            dlg = ft.AlertDialog(title=ft.Text("Sucesso!"), content=ft.Text(f"Arquivo salvo em:\n{out}"))
+            page.dialog = dlg
+            dlg.open = True
+            page.update()
+        except Exception as e:
+            add_log(marca, f"ERRO FATAL: {str(e)}")
+            dlg = ft.AlertDialog(title=ft.Text("Erro"), content=ft.Text(str(e)))
+            page.dialog = dlg
+            dlg.open = True
+            page.update()
+
+    def on_click_process(e):
+        marca = e.control.data
+        txt = files_state[marca]["txt"]
+        xls = files_state[marca]["xls"]
+        if not txt or not xls:
+            dlg = ft.AlertDialog(title=ft.Text("Erro"), content=ft.Text("Selecione os dois arquivos!"))
+            page.dialog = dlg
+            dlg.open = True
+            page.update()
+            return
+        log_controls[marca].controls.clear()
+        log_controls[marca].update()
+        t = threading.Thread(target=run_process, args=(marca,))
+        t.start()
+
+    def create_brand_tab(marca, label_file):
+        txt_field = ft.TextField(label=label_file, read_only=True, expand=True, bgcolor="white", text_size=12,
+                                 border_color=COL_MAIN)
+        xls_field = ft.TextField(label="Planilha Excel", read_only=True, expand=True, bgcolor="white", text_size=12,
+                                 border_color=COL_MAIN)
+        input_refs[f"{marca}_txt"] = txt_field
+        input_refs[f"{marca}_xls"] = xls_field
+        ext_principal = ["pdf"] if marca == "AMANCO" else ["txt"]
+
+        btn_txt = ft.IconButton(
+            icon=ft.Icons.FOLDER_OPEN, icon_color=COL_ACCENT, bgcolor="white",
+            on_click=lambda _: start_picker(marca, "txt", ext_principal)
+        )
+        btn_xls = ft.IconButton(
+            icon=ft.Icons.FOLDER_OPEN, icon_color=COL_ACCENT, bgcolor="white",
+            on_click=lambda _: start_picker(marca, "xls", ["xlsx", "xls", "csv"])
+        )
+
+        return ft.Container(
+            padding=20, bgcolor=COL_PANEL, border_radius=10,
+            content=ft.Column([
+                ft.Text(f"Conferência {marca}", size=20, weight=ft.FontWeight.BOLD, color=COL_DARK),
+                ft.Divider(color=COL_ACCENT, thickness=2),
+                ft.Row([txt_field, btn_txt], alignment=ft.MainAxisAlignment.CENTER),
+                ft.Row([xls_field, btn_xls], alignment=ft.MainAxisAlignment.CENTER),
+                ft.Container(height=20),
+                ft.ElevatedButton(
+                    text=f"PROCESSAR {marca}", icon=ft.Icons.ROCKET_LAUNCH,
+                    style=ft.ButtonStyle(bgcolor=COL_ACCENT, color="white", padding=20,
+                                         shape=ft.RoundedRectangleBorder(radius=8)),
+                    width=400, data=marca, on_click=on_click_process
+                ),
+                ft.Container(height=20),
+                ft.Text("Log de Execução:", weight=ft.FontWeight.BOLD, color=COL_DARK),
+                ft.Container(content=log_controls[marca], bgcolor=COL_DARK, border_radius=10, padding=10, height=200)
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+        )
+
+    try:
+        logo = ft.Image(src="logo.png", height=80, fit=ft.ImageFit.CONTAIN)
+    except:
+        logo = ft.Icon(ft.Icons.CONSTRUCTION, size=80, color="white")
+
+    header = ft.Column([
+        logo,
+        ft.Text("CONSTRUMIL", size=30, weight=ft.FontWeight.BOLD, color="white"),
+        ft.Text("Sistema de Conferência Inteligente v14.0", color="#cccccc")
+    ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+
+    tabs = ft.Tabs(
+        selected_index=0, animation_duration=300,
+        tabs=[
+            ft.Tab(text="DECA", content=create_brand_tab("DECA", "Arquivo TXT (Extraído)")),
+            ft.Tab(text="AMANCO", content=create_brand_tab("AMANCO", "Arquivo PDF (Original)")),
+            ft.Tab(text="LORENZETTI", content=create_brand_tab("LORENZETTI", "Arquivo TXT (Extraído)")),
+        ], expand=1,
+    )
+
+    page.add(
+        ft.Container(content=header, padding=ft.padding.only(top=20, bottom=20), alignment=ft.alignment.center),
+        ft.Container(content=tabs, expand=True, padding=20, bgcolor="white",
+                     border_radius=ft.border_radius.only(top_left=20, top_right=20))
+    )
+
+
+ft.app(target=main)
+
+
+import flet as ft
+import pandas as pd
+import re
+import os
+import itertools
+import threading
+from pathlib import Path
+import warnings
+from openpyxl.styles import PatternFill, Font
+
+# Tenta importar pdfplumber (Essencial para Amanco)
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
+warnings.filterwarnings('ignore')
+
+
+# ==============================================================================
+#  CÉREBRO 1: DECA (TXT + EXCEL)
+# ==============================================================================
+class DecaEngine:
+    def normalizar_codigo_pdf(self, codigo: str) -> list:
+        if not codigo: return []
+        codigo = str(codigo).upper().strip()
+        variacoes = set([codigo, codigo.replace('.', ''), codigo.replace('.', '-'), codigo.replace('.', ' ')])
+        mapa_fracoes = {'012': '1/2', '034': '3/4', '001': '1', '014': '1/4', '112': '1 1/2', '114': '1 1/4'}
+        partes = codigo.split('.')
+        if len(partes) >= 2:
+            tokens = []
+            for p in partes:
+                if p in mapa_fracoes:
+                    tokens.append([p, mapa_fracoes[p]])
+                elif re.match(r'^[A-Z]\d{2,3}$', p):
+                    tokens.append([p, f"{p[0]}-{p[1:]}", f"{p[0]} {p[1:]}"])
+                else:
+                    tokens.append([p])
+            for combo in itertools.product(*tokens):
+                variacoes.update([" ".join(combo), "-".join(combo), "".join(combo), " ".join(reversed(combo))])
+                if len(combo) == 3:
+                    variacoes.update([" ".join(p) for p in itertools.permutations(combo)])
+                    variacoes.add(f"{combo[0]}{combo[1]} {combo[2]}")
+                    variacoes.add(f"{combo[0]}{combo[1]} {combo[2].replace('/', '')}")
+        return [v.strip() for v in variacoes if len(v.strip()) > 2]
+
+    def buscar_codigo_na_descricao(self, descricao: str, variacoes_codigo: list) -> bool:
+        if not descricao or not variacoes_codigo: return False
+        desc_upper = str(descricao).upper()
+        for v in variacoes_codigo:
+            v_upper = v.upper()
+            if v_upper in desc_upper: return True
+            tokens = v_upper.split()
+            if len(tokens) > 1:
+                desc_limpa_tokens = re.sub(r'[^\w\s/]', ' ', desc_upper)
+                if all((t in desc_limpa_tokens or t in desc_upper) for t in tokens if len(t) > 1): return True
+            v_super_limpa = re.sub(r'[^A-Z0-9]', '', v_upper)
+            if len(v_super_limpa) > 4 and v_super_limpa in re.sub(r'[^A-Z0-9]', '', desc_upper): return True
+        return False
+
+    def limpar_valor(self, valor) -> float:
+        if pd.isna(valor) or valor == '': return 0.0
+        v = str(valor).replace('R$', '').replace('BRL', '').strip()
+        if re.search(r'\d{1,3}(\.\d{3})*,\d{2}', v):
+            v = v.replace('.', '').replace(',', '.')
+        elif ',' in v and v.count(',') == 1 and len(v.split(',')[1]) == 2:
+            v = v.replace(',', '.')
+        try:
+            return float(re.sub(r'[^\d.]', '', v))
+        except:
+            return 0.0
+
+    def ler_pdf_extraido(self, caminho_txt: str) -> pd.DataFrame:
+        with open(caminho_txt, 'r', encoding='utf-8') as f:
+            conteudo = f.read()
+        produtos = []
+        padroes = [
+            r'(?m)^([A-Z0-9][A-Z0-9.\-]{2,}(?:\.[A-Z0-9]+)*)\s+(?:.*?)\s+(\d{2}/\d{2}/\d{4})\s+(?:BRL\s*)?([\d.,]+)\s+([\d.,]+)',
+            r'(?m)^([A-Z0-9][A-Z0-9.\-]{2,}(?:\.[A-Z0-9]+)*)\t.*?\t(\d{2}/\d{2}/\d{4})\t(?:BRL\s*)?([\d.,]+)\t([\d.,]+)'
+        ]
+        for padrao in padroes:
+            for match in re.findall(padrao, conteudo):
+                if len(match) < 4: continue
+                cod, data, val_s, qtd_s = match[:4]
+                cod = cod.strip()
+                if len(cod) < 5 or cod == '2025' or 'BRL' in cod or '/' in cod: continue
+                qtd = int(self.limpar_valor(qtd_s))
+                if qtd > 0: produtos.append({'Código PDF': cod, 'Qtd PDF': qtd, 'Valor PDF': self.limpar_valor(val_s)})
+        df = pd.DataFrame(produtos)
+        return df.drop_duplicates(subset=['Código PDF']) if not df.empty else df
+
+    def ler_excel(self, caminho_excel: str) -> pd.DataFrame:
+        try:
+            df = pd.read_excel(caminho_excel, sheet_name="Produtos")
+        except:
+            try:
+                df = pd.read_excel(caminho_excel)
+            except:
+                try:
+                    df = pd.read_csv(caminho_excel, sep=';', encoding='latin1')
+                except:
+                    raise Exception("Falha ao ler Excel/CSV.")
+
+        df.columns = [str(c).strip() for c in df.columns]
+        col_prod = next((c for c in df.columns if 'descri' in c.lower()), None)
+        if not col_prod:
+            for c in df.columns:
+                cl = c.lower()
+                if ('produto' in cl or 'nome' in cl) and not ('código' in cl or 'codigo' in cl or 'cod' in cl):
+                    col_prod = c
+                    break
+        if not col_prod: col_prod = next((c for c in df.columns if 'produto' in c.lower()), None)
+        col_qtd = next((c for c in df.columns if any(x in c.lower() for x in ['compra', 'qtd', 'quantidade'])), None)
+        col_val = next((c for c in df.columns if any(x in c.lower() for x in ['valor', 'preço', 'vlr', 'preco'])), None)
+
+        if not col_prod: raise Exception("Coluna de DESCRIÇÃO não encontrada.")
+        df_novo = pd.DataFrame()
+        df_novo['Produto Excel'] = df[col_prod]
+        df_novo['Qtd Excel'] = df[col_qtd] if col_qtd else 0
+        df_novo['Valor Excel'] = df[col_val] if col_val else 0.0
+        return df_novo
+
+    def processar(self, txt_path, excel_path, log_func):
+        log_func("DECA: Lendo TXT extraído...")
+        df_pdf = self.ler_pdf_extraido(txt_path)
+        log_func(f"DECA: {len(df_pdf)} códigos no TXT.")
+
+        log_func("DECA: Lendo Excel...")
+        df_excel = self.ler_excel(excel_path)
+        log_func(f"DECA: {len(df_excel)} linhas no Excel.")
+
+        log_func("DECA: Cruzando dados...")
+        resultados = []
+        matches = 0
+        for i, row in df_pdf.iterrows():
+            cod, qtd, val = str(row['Código PDF']), row['Qtd PDF'], row['Valor PDF']
+            variacoes = self.normalizar_codigo_pdf(cod)
+            match_data, melhor_diff = None, float('inf')
+
+            for _, row_ex in df_excel.iterrows():
+                desc = str(row_ex['Produto Excel'])
+                if self.buscar_codigo_na_descricao(desc, variacoes):
+                    diff = abs(val - self.limpar_valor(row_ex['Valor Excel']))
+                    if diff < melhor_diff:
+                        melhor_diff = diff
+                        match_data = row_ex
+
+            diff_qtd, diff_val = qtd, val
+            status = "❌ NÃO ENCONTRADO"
+            prod_ex, qtd_ex, val_ex = "---", 0, 0.0
+
+            if match_data is not None:
+                matches += 1
+                qtd_ex = int(self.limpar_valor(match_data['Qtd Excel']))
+                val_ex = self.limpar_valor(match_data['Valor Excel'])
+                diff_qtd = qtd - qtd_ex
+                diff_val = val - val_ex
+                prod_ex = match_data['Produto Excel']
+                status = "✅ OK" if diff_qtd == 0 and abs(diff_val) < 0.2 else "⚠ DIVERGENTE"
+
+            resultados.append({
+                'Código PDF': cod, 'Produto Excel': prod_ex,
+                'Qtd PDF': qtd, 'Qtd Excel': qtd_ex, 'Diferença Qtd': diff_qtd,
+                'Valor PDF': val, 'Valor Excel': val_ex, 'Diferença Valor': diff_val,
+                'Status': status
+            })
+
+        log_func(f"DECA: Matches: {matches}/{len(df_pdf)}")
+        return self.salvar(resultados, txt_path, "DECA", log_func)
+
+    def salvar(self, resultados, path, marca, log_func):
+        out_path = Path(path).parent / (Path(path).stem + f"_{marca}_RELATORIO.xlsx")
+        df = pd.DataFrame(resultados)
+        with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Conferência')
+            ws = writer.sheets['Conferência']
+            red = PatternFill(start_color='FFCCCC', end_color='FFCCCC', fill_type='solid')
+            green = PatternFill(start_color='CCFFCC', end_color='CCFFCC', fill_type='solid')
+            for row in range(2, ws.max_row + 1):
+                c = ws.cell(row=row, column=5)
+                if c.value and c.value != 0: c.fill = red if c.value < 0 else green
+                c = ws.cell(row=row, column=8)
+                if c.value and c.value != 0: c.fill = red if c.value > 0 else green
+            for col in ws.columns: ws.column_dimensions[col[0].column_letter].width = 15
+        log_func(f"{marca}: Salvo em {out_path.name}")
+        return out_path
+
+
+# ==============================================================================
+#  CÉREBRO 2: AMANCO (PDF + EXCEL) - ISOLADO E INDEPENDENTE
+# ==============================================================================
+class AmancoEngine:
+    def __init__(self):
+        if pdfplumber is None:
+            raise Exception("pdfplumber não instalado. Execute: pip install pdfplumber")
+
+    def extract_product_code(self, product_text):
+        if pd.isna(product_text): return None
+        matches = re.findall(r'\b(\d{4,6})\b', str(product_text))
+        return matches[-1] if matches else None
+
+    def clean_price(self, price_text):
+        if pd.isna(price_text): return None
+        price_str = str(price_text).replace('R$', '').replace('.', '').replace(',', '.').strip()
+        try:
+            return float(price_str)
+        except ValueError:
+            return None
+
+    def ler_excel(self, caminho_excel, log_func):
+        log_func(f"AMANCO: Lendo Excel: {Path(caminho_excel).name}")
+        try:
+            try:
+                df_excel = pd.read_excel(caminho_excel)
+            except:
+                df_excel = pd.read_csv(caminho_excel, sep=';', encoding='latin1')
+
+            col_prod = next((c for c in df_excel.columns if 'produto' in c.lower()), 'Produto')
+            df_excel['Código Extraído'] = df_excel[col_prod].apply(self.extract_product_code)
+
+            # Identifica colunas
+            col_compra = next(
+                (c for c in df_excel.columns if 'compra' in c.lower() and 'valor' not in c.lower()), None)
+            col_valor = next((c for c in df_excel.columns if 'valor' in c.lower()), None)
+
+            if col_compra:
+                df_excel['Compra'] = pd.to_numeric(df_excel[col_compra], errors='coerce')
+            if col_valor:
+                df_excel['Valor de compra'] = pd.to_numeric(df_excel[col_valor], errors='coerce')
+
+            log_func(f"AMANCO: Excel lido: {len(df_excel)} linhas")
+            return df_excel
+        except Exception as e:
+            log_func(f"AMANCO: Erro ao ler Excel: {e}")
+            raise
+
+    def ler_pdf(self, caminho_pdf, log_func):
+        log_func(f"AMANCO: Lendo PDF: {Path(caminho_pdf).name}")
+        try:
+            pdf_data = []
+            with pdfplumber.open(caminho_pdf) as pdf:
+                for page_num, page in enumerate(pdf.pages, 1):
+                    log_func(f"AMANCO: Processando página {page_num}/{len(pdf.pages)}")
+
+                    # Tenta extrair tabelas estruturadas
+                    tables = page.extract_tables()
+                    if tables:
+                        for table in tables:
+                            if len(table) < 2: continue
+                            header = [str(h).lower() if h else '' for h in table[0]]
+                            codigo_idx = next((i for i, h in enumerate(header) if 'código' in h or 'codigo' in h), None)
+                            qtde_idx = next((i for i, h in enumerate(header) if 'qtde' in h or 'quantidade' in h), None)
+                            preco_idx = next((i for i, h in enumerate(header) if 'preço' in h or 'preco' in h), None)
+
+                            if None in (codigo_idx, qtde_idx, preco_idx):
+                                continue
+
+                            for row in table[1:]:
+                                try:
+                                    if len(row) > max(codigo_idx, qtde_idx, preco_idx):
+                                        c = str(row[codigo_idx]).strip() if row[codigo_idx] else None
+                                        if c and re.match(r'^\d{4,6}$', c):
+                                            pdf_data.append({
+                                                'Código_PDF': c,
+                                                'Qtde_PDF': row[qtde_idx],
+                                                'Preço_Líq_PDF': row[preco_idx]
+                                            })
+                                except:
+                                    continue
+
+                    # Fallback: Tenta regex no texto bruto
+                    if not tables or not pdf_data:
+                        text = page.extract_text()
+                        if text:
+                            for line in text.split('\n'):
+                                match = re.match(
+                                    r'^(\d{4,6})\s+.*?(?:BR\d+|0\d+)\s*-\s*.*?\s+(\d+)\s+R\$\s*([\d.,]+)',
+                                    line
+                                )
+                                if match:
+                                    pdf_data.append({
+                                        'Código_PDF': match.group(1),
+                                        'Qtde_PDF': match.group(2),
+                                        'Preço_Líq_PDF': match.group(3)
+                                    })
+
+            df_pdf = pd.DataFrame(pdf_data)
+            if not df_pdf.empty:
+                df_pdf['Qtde_PDF'] = pd.to_numeric(df_pdf['Qtde_PDF'], errors='coerce')
+                df_pdf['Preço_Líq_PDF'] = df_pdf['Preço_Líq_PDF'].apply(self.clean_price)
+                df_pdf = df_pdf.drop_duplicates(subset=['Código_PDF'], keep='first')
+
+            log_func(f"AMANCO: PDF lido: {len(df_pdf)} itens extraídos")
+            return df_pdf
+        except Exception as e:
+            log_func(f"AMANCO: Erro ao ler PDF: {e}")
+            raise
+
+    def processar(self, pdf_path, excel_path, log_func):
+        log_func("AMANCO: Iniciando processamento...")
+
+        # Lê arquivos
+        df_excel = self.ler_excel(excel_path, log_func)
+        df_pdf = self.ler_pdf(pdf_path, log_func)
+
+        # Combina dados
+        log_func("AMANCO: Combinando dados...")
+        if df_pdf.empty:
+            df_result = df_excel.copy()
+            df_result['Qtde_PDF'] = None
+            df_result['Preço_Líq_PDF'] = None
+        else:
+            df_result = df_excel.merge(
+                df_pdf,
+                left_on='Código Extraído',
+                right_on='Código_PDF',
+                how='left'
+            )
+            if 'Código_PDF' in df_result.columns:
+                df_result = df_result.drop('Código_PDF', axis=1)
+
+        matches = df_result['Qtde_PDF'].notna().sum()
+        log_func(f"AMANCO: Combinação: {matches} correspondências")
+
+        # Calcula diferenças
+        log_func("AMANCO: Calculando diferenças...")
+        df_result['Diferença de Qtde'] = df_result['Qtde_PDF'] - df_result.get('Compra', 0)
+        df_result['Diferença de Preço'] = df_result['Preço_Líq_PDF'] - df_result.get('Valor de compra', 0)
+
+        # Salva resultado
+        out_path = Path(pdf_path).parent / (Path(pdf_path).stem + "_AMANCO_RELATORIO.xlsx")
+        log_func(f"AMANCO: Salvando em: {Path(out_path).name}")
+
+        with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
+            df_result.to_excel(writer, index=False, sheet_name='Comparação')
+            ws = writer.sheets['Comparação']
+            red = PatternFill(start_color='FFCCCC', end_color='FFCCCC', fill_type='solid')
+            green = PatternFill(start_color='CCFFCC', end_color='CCFFCC', fill_type='solid')
+
+            headers = [c.value for c in ws[1]]
+            try:
+                qc = headers.index('Diferença de Qtde') + 1
+                pc = headers.index('Diferença de Preço') + 1
+                for row in range(2, len(df_result) + 2):
+                    c = ws.cell(row=row, column=qc)
+                    if c.value: c.fill = green if float(c.value) > 0 else red
+                    c = ws.cell(row=row, column=pc)
+                    if c.value: c.fill = red if float(c.value) > 0 else green
+            except:
+                pass
+            for col in ws.columns:
+                ws.column_dimensions[col[0].column_letter].width = 20
+
+        log_func("AMANCO: Processamento concluído!")
+        return out_path
+
+
+# ==============================================================================
+#  CÉREBRO 3: LORENZETTI (TXT + EXCEL)
+# ==============================================================================
+class LorenzettiEngine:
+    def limpar_valor(self, valor) -> float:
+        if pd.isna(valor) or valor == '': return 0.0
+        v = str(valor).replace('R$', '').replace(' ', '').strip()
+        if v.count('.') > 0 and v.count(',') > 0: v = v.replace('.', '')
+        v = v.replace(',', '.')
+        try:
+            return float(v)
+        except:
+            return 0.0
+
+    def extract_features(self, text):
+        text = str(text).upper()
+        clean_text = text.replace('LORENZETTI', '')
+        codes = set()
+        matches = re.findall(r'\b\d{3,4}[-\s]?[A-Z0-9]{1,3}\b', clean_text)
+        for m in matches:
+            if m.isdigit() and len(m) < 4: continue
+            if any(x in m for x in ['127', '220', '5500', '7500']): continue
+            codes.add(m.replace(' ', '').replace('-', ''))
+        nums = re.findall(r'\d+', clean_text)
+        nums = {int(n) for n in nums if int(n) > 20}
+        tokens = re.findall(r'[A-Z]+', clean_text)
+        tokens = {t for t in tokens if len(t) > 2 and t not in ['COM', 'PARA', 'DUCHA', 'TORNEIRA']}
+        first_word = text.split()[0] if text.split() else ""
+        return {'codes': codes, 'nums': nums, 'tokens': tokens, 'first': first_word}
+
+    def calculate_score(self, feat_exc, feat_pdf):
+        score = 0
+        if (220 in feat_exc['nums'] and 220 not in feat_pdf['nums'] and 127 in feat_pdf['nums']): return -1000
+        if (127 in feat_exc['nums'] and 127 not in feat_pdf['nums'] and 220 in feat_pdf['nums']): return -1000
+        if feat_exc['codes'].intersection(feat_pdf['codes']): score += 100
+        score += len(feat_exc['nums'].intersection(feat_pdf['nums'])) * 15
+        w1, w2 = feat_exc['first'], feat_pdf['first']
+        if w1 == w2:
+            score += 30
+        elif w1 in w2 or w2 in w1:
+            score += 20
+        score += len(feat_exc['tokens'].intersection(feat_pdf['tokens'])) * 10
+        return score
+
+    def ler_pdf_txt(self, caminho_txt):
+        with open(caminho_txt, 'r', encoding='utf-8') as f:
+            conteudo = f.read()
+        produtos = []
+        regex = r'(?m)^\s*\d+\s+\d{13}\s+(\d{5,8})\s+(.*?)\s+(PC|UN|CX|JG|KT|PEC|PÇ)\s+([0-9.]+)\s+([0-9,]+)'
+        for match in re.findall(regex, conteudo):
+            cod, desc, um, qtd, preco = match
+            if not cod.isdigit(): continue
+            produtos.append({
+                'Código PDF': cod.strip(), 'Descrição PDF': desc.strip(),
+                'Qtd PDF': int(self.limpar_valor(qtd)), 'Valor PDF': self.limpar_valor(preco)
+            })
+        df = pd.DataFrame(produtos)
+        if not df.empty: df = df.drop_duplicates(subset=['Código PDF'])
+        return df
+
+    def processar(self, txt_path, excel_path, log_func):
+        log_func("LORENZETTI: Lendo TXT...")
+        df_pdf = self.ler_pdf_txt(txt_path)
+        log_func("LORENZETTI: Lendo Excel...")
+        try:
+            df_excel = pd.read_excel(excel_path)
+        except:
+            df_excel = pd.read_csv(excel_path, sep=';', encoding='latin1')
+
+        try:
+            col_prod = "Produto"
+            col_qtd = "Compra"
+            col_val = "Valor de compra"
+            if col_prod not in df_excel.columns: df_excel.columns = [c.strip() for c in df_excel.columns]
+        except:
+            pass
+        if col_prod not in df_excel.columns:
+            col_prod = next((c for c in df_excel.columns if 'produto' in c.lower()), df_excel.columns[1])
+            col_qtd = next((c for c in df_excel.columns if 'compra' in c.lower()), df_excel.columns[2])
+            col_val = next((c for c in df_excel.columns if 'valor' in c.lower()), df_excel.columns[3])
+
+        pdf_features = []
+        for idx, row in df_pdf.iterrows():
+            pdf_features.append(
+                {'row': row, 'feat': self.extract_features(row['Descrição PDF'] + " " + str(row['Código PDF']))})
+
+        resultados = []
+        matches = 0
+        for _, row_ex in df_excel.iterrows():
+            desc_ex = str(row_ex[col_prod])
+            feat_ex = self.extract_features(desc_ex)
+            best_score = 0
+            best_match = None
+            for item in pdf_features:
+                score = self.calculate_score(feat_ex, item['feat'])
+                if score > best_score:
+                    best_score = score
+                    best_match = item['row']
+
+            status = "❌ NÃO ENCONTRADO"
+            cod_pdf, desc_pdf, qtd_pdf, val_pdf = "---", "---", 0, 0.0
+            if best_match is not None and best_score > 30:
+                matches += 1
+                cod_pdf = best_match['Código PDF']
+                desc_pdf = best_match['Descrição PDF']
+                qtd_pdf = best_match['Qtd PDF']
+                val_pdf = best_match['Valor PDF']
+                qtd_ex = int(self.limpar_valor(row_ex.get(col_qtd, 0)))
+                val_ex = self.limpar_valor(row_ex.get(col_val, 0))
+                status = "✅ OK" if (qtd_pdf - qtd_ex == 0) and (abs(val_pdf - val_ex) < 0.2) else "⚠ DIVERGENTE"
+            else:
+                qtd_ex = int(self.limpar_valor(row_ex.get(col_qtd, 0)))
+                val_ex = self.limpar_valor(row_ex.get(col_val, 0))
+
+            resultados.append({
+                'Descrição Excel': desc_ex, 'Descrição PDF': desc_pdf, 'Código PDF': cod_pdf,
+                'Qtd PDF': qtd_pdf, 'Qtd Excel': qtd_ex, 'Diferença Qtd': qtd_pdf - qtd_ex,
+                'Valor PDF': val_pdf, 'Valor Excel': val_ex, 'Diferença Valor': val_pdf - val_ex,
+                'Status': status
+            })
+
+        log_func(f"LORENZETTI: Matches: {matches}/{len(df_excel)}")
+        return self.salvar(resultados, txt_path, "LORENZETTI", log_func)
+
+    def salvar(self, resultados, path, marca, log_func):
+        out_path = Path(path).parent / (Path(path).stem + f"_{marca}_RELATORIO.xlsx")
+        df = pd.DataFrame(resultados)
+        with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Conferência')
+            ws = writer.sheets['Conferência']
+            red = PatternFill(start_color='FFCCCC', end_color='FFCCCC', fill_type='solid')
+            green = PatternFill(start_color='CCFFCC', end_color='CCFFCC', fill_type='solid')
+            for row in range(2, ws.max_row + 1):
+                c = ws.cell(row=row, column=6)
+                if c.value and c.value != 0: c.fill = red if c.value < 0 else green
+                c = ws.cell(row=row, column=9)
+                if c.value and c.value != 0: c.fill = red if c.value > 0 else green
+            ws.column_dimensions['A'].width = 40
+            ws.column_dimensions['B'].width = 40
+        log_func(f"{marca}: Salvo em {out_path.name}")
+        return out_path
+
+
+# ==============================================================================
+#  INTERFACE FLET UNIFICADA COM ENGINES INDEPENDENTES
+# ==============================================================================
+
+def main(page: ft.Page):
+    page.title = "SISTEMA CONSTRUMIL - Conferência Inteligente"
+    page.window_width = 1000
+    page.window_height = 800
+    page.bgcolor = "#006cb5"
+    page.padding = 0
+    page.theme_mode = ft.ThemeMode.LIGHT
+
+    COL_MAIN = "#006cb5"
+    COL_PANEL = "#91d8f6"
+    COL_ACCENT = "#ec3237"
+    COL_TEXT = "#fefefe"
+    COL_DARK = "#0A1931"
+
+    # Estrutura de arquivos reorganizada: cada marca tem seus tipos específicos
+    files_state = {
+        "DECA": {"arquivo1": None, "arquivo2": None},  # TXT + Excel
+        "AMANCO": {"arquivo1": None, "arquivo2": None},  # PDF + Excel
+        "LORENZETTI": {"arquivo1": None, "arquivo2": None}  # TXT + Excel
+    }
+    input_refs = {}
+
+    log_controls = {
+        "DECA": ft.Column(scroll=ft.ScrollMode.AUTO, height=200),
+        "AMANCO": ft.Column(scroll=ft.ScrollMode.AUTO, height=200),
+        "LORENZETTI": ft.Column(scroll=ft.ScrollMode.AUTO, height=200),
+    }
+
+    def add_log(marca, msg):
+        log_controls[marca].controls.append(ft.Text(f"> {msg}", color="#00FF00", font_family="Consolas"))
+        log_controls[marca].update()
+
+    picker_context = {"marca": None, "tipo": None}
+
+    def pick_file_result(e: ft.FilePickerResultEvent):
+        if e.files:
+            file_path = e.files[0].path
+            marca = picker_context["marca"]
+            tipo = picker_context["tipo"]
+            files_state[marca][tipo] = file_path
+            ref_key = f"{marca}_{tipo}"
+            if ref_key in input_refs:
+                input_refs[ref_key].value = file_path
+                input_refs[ref_key].update()
+
+    file_picker = ft.FilePicker(on_result=pick_file_result)
+    page.overlay.append(file_picker)
+
+    def start_picker(marca, tipo, allowed_ext):
+        picker_context["marca"] = marca
+        picker_context["tipo"] = tipo
+        file_picker.pick_files(allow_multiple=False, allowed_extensions=allowed_ext)
+
+    def run_process(marca):
+        arquivo1 = files_state[marca]["arquivo1"]
+        arquivo2 = files_state[marca]["arquivo2"]
+
+        try:
+            if marca == "DECA":
+                engine = DecaEngine()
+                add_log(marca, "Usando DECA Engine (TXT + Excel)")
+                out = engine.processar(arquivo1, arquivo2, lambda m: add_log(marca, m))
+            elif marca == "AMANCO":
+                engine = AmancoEngine()
+                add_log(marca, "Usando AMANCO Engine (PDF + Excel)")
+                out = engine.processar(arquivo1, arquivo2, lambda m: add_log(marca, m))
+            else:
+                engine = LorenzettiEngine()
+                add_log(marca, "Usando LORENZETTI Engine (TXT + Excel)")
+                out = engine.processar(arquivo1, arquivo2, lambda m: add_log(marca, m))
+
+            add_log(marca, "✅ SUCESSO COMPLETO!")
+
+            dlg = ft.AlertDialog(
+                title=ft.Text("✅ Sucesso!"),
+                content=ft.Text(f"Arquivo salvo em:\n{out}")
+            )
+            page.dialog = dlg
+            dlg.open = True
+            page.update()
+        except Exception as e:
+            add_log(marca, f"❌ ERRO FATAL: {str(e)}")
+            dlg = ft.AlertDialog(
+                title=ft.Text("❌ Erro"),
+                content=ft.Text(str(e))
+            )
+            page.dialog = dlg
+            dlg.open = True
+            page.update()
+
+    def on_click_process(e):
+        marca = e.control.data
+        arquivo1 = files_state[marca]["arquivo1"]
+        arquivo2 = files_state[marca]["arquivo2"]
+        if not arquivo1 or not arquivo2:
+            dlg = ft.AlertDialog(
+                title=ft.Text("⚠️ Erro"),
+                content=ft.Text("Selecione os dois arquivos!")
+            )
+            page.dialog = dlg
+            dlg.open = True
+            page.update()
+            return
+        log_controls[marca].controls.clear()
+        log_controls[marca].update()
+        t = threading.Thread(target=run_process, args=(marca,))
+        t.start()
+
+    def create_brand_tab(marca, label_arquivo1, ext_arquivo1):
+        """
+        Cria a aba para cada marca com suas especificações
+        marca: Nome da marca (DECA, AMANCO, LORENZETTI)
+        label_arquivo1: Label do primeiro arquivo (ex: "Arquivo TXT", "Arquivo PDF")
+        ext_arquivo1: Extensões permitidas para o primeiro arquivo
+        """
+        arquivo1_field = ft.TextField(
+            label=label_arquivo1,
+            read_only=True,
+            expand=True,
+            bgcolor="white",
+            text_size=12,
+            border_color=COL_MAIN
+        )
+        arquivo2_field = ft.TextField(
+            label="Planilha Excel",
+            read_only=True,
+            expand=True,
+            bgcolor="white",
+            text_size=12,
+            border_color=COL_MAIN
+        )
+        input_refs[f"{marca}_arquivo1"] = arquivo1_field
+        input_refs[f"{marca}_arquivo2"] = arquivo2_field
+
+        btn_arquivo1 = ft.IconButton(
+            icon=ft.Icons.FOLDER_OPEN,
+            icon_color=COL_ACCENT,
+            bgcolor="white",
+            on_click=lambda _: start_picker(marca, "arquivo1", ext_arquivo1)
+        )
+        btn_arquivo2 = ft.IconButton(
+            icon=ft.Icons.FOLDER_OPEN,
+            icon_color=COL_ACCENT,
+            bgcolor="white",
+            on_click=lambda _: start_picker(marca, "arquivo2", ["xlsx", "xls", "csv"])
+        )
+
+        return ft.Container(
+            padding=20,
+            bgcolor=COL_PANEL,
+            border_radius=10,
+            content=ft.Column([
+                ft.Text(
+                    f"Conferência {marca}",
+                    size=20,
+                    weight=ft.FontWeight.BOLD,
+                    color=COL_DARK
+                ),
+                ft.Divider(color=COL_ACCENT, thickness=2),
+                ft.Row([arquivo1_field, btn_arquivo1], alignment=ft.MainAxisAlignment.CENTER),
+                ft.Row([arquivo2_field, btn_arquivo2], alignment=ft.MainAxisAlignment.CENTER),
+                ft.Container(height=20),
+                ft.ElevatedButton(
+                    text=f"PROCESSAR {marca}",
+                    icon=ft.Icons.ROCKET_LAUNCH,
+                    style=ft.ButtonStyle(
+                        bgcolor=COL_ACCENT,
+                        color="white",
+                        padding=20,
+                        shape=ft.RoundedRectangleBorder(radius=8)
+                    ),
+                    width=400,
+                    data=marca,
+                    on_click=on_click_process
+                ),
+                ft.Container(height=20),
+                ft.Text("Log de Execução:", weight=ft.FontWeight.BOLD, color=COL_DARK),
+                ft.Container(
+                    content=log_controls[marca],
+                    bgcolor=COL_DARK,
+                    border_radius=10,
+                    padding=10,
+                    height=200
+                )
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+        )
+
+    try:
+        logo = ft.Image(src="logo.png", height=80, fit=ft.ImageFit.CONTAIN)
+    except:
+        logo = ft.Icon(ft.Icons.CONSTRUCTION, size=80, color="white")
+
+    header = ft.Column([
+        logo,
+        ft.Text("CONSTRUMIL", size=30, weight=ft.FontWeight.BOLD, color="white"),
+        ft.Text("Sistema de Conferência Inteligente v15.0", color="#cccccc")
+    ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+
+    tabs = ft.Tabs(
+        selected_index=0,
+        animation_duration=300,
+        tabs=[
+            ft.Tab(
+                text="DECA",
+                content=create_brand_tab("DECA", "Arquivo TXT (Extraído)", ["txt"])
+            ),
+            ft.Tab(
+                text="AMANCO",
+                content=create_brand_tab("AMANCO", "Arquivo PDF (Original)", ["pdf"])
+            ),
+            ft.Tab(
+                text="LORENZETTI",
+                content=create_brand_tab("LORENZETTI", "Arquivo TXT (Extraído)", ["txt"])
+            ),
+        ],
+        expand=1,
+    )
+
+    page.add(
+        ft.Container(
+            content=header,
+            padding=ft.padding.only(top=20, bottom=20),
+            alignment=ft.alignment.center
+        ),
+        ft.Container(
+            content=tabs,
+            expand=True,
+            padding=20,
+            bgcolor="white",
+            border_radius=ft.border_radius.only(top_left=20, top_right=20)
+        )
+    )
+
+
+ft.app(target=main)
+
+
+
+
+
